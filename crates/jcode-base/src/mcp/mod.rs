@@ -1,10 +1,11 @@
 //! MCP (Model Context Protocol) client implementation
 //!
-//! Connects to MCP servers that provide tools via JSON-RPC over stdio.
-//! Supports shared server pools so multiple sessions reuse the same
-//! MCP server processes instead of spawning duplicates.
+//! Connects to MCP servers that provide tools via JSON-RPC over stdio or
+//! streamable HTTP. Supports shared server pools so multiple sessions reuse
+//! the same MCP server connections instead of spawning duplicates.
 
 mod client;
+mod http;
 mod manager;
 pub mod pool;
 mod protocol;
