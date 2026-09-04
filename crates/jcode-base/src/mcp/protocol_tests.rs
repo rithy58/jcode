@@ -143,7 +143,72 @@ fn test_mcp_http_server_is_not_stdio() {
     let config: McpConfig = serde_json::from_str(json).unwrap();
     let server = config.servers.get("remote").unwrap();
     assert!(!server.is_stdio());
+    assert!(server.is_http());
+    assert!(server.is_runnable());
     assert_eq!(server.url.as_deref(), Some("https://example.com/mcp"));
+}
+
+#[test]
+fn http_transport_detection_covers_the_documented_config_shapes() {
+    let case = |json: &str| -> McpServerConfig { serde_json::from_str(json).unwrap() };
+
+    // Explicit http/streamable-http types with a URL are http.
+    assert!(case(r#"{"type":"http","url":"https://x.test/mcp"}"#).is_http());
+    assert!(case(r#"{"type":"streamable-http","url":"https://x.test/mcp"}"#).is_http());
+
+    // A bare URL without a command defaults to http.
+    let bare = case(r#"{"url":"https://x.test/mcp"}"#);
+    assert!(bare.is_http() && !bare.is_stdio());
+
+    // A command without a transport stays stdio even when a URL is present.
+    let both = case(r#"{"command":"npx","url":"https://x.test/mcp"}"#);
+    assert!(both.is_stdio() && !both.is_http());
+
+    // The legacy two-endpoint SSE transport stays unsupported.
+    let sse = case(r#"{"type":"sse","url":"https://x.test/sse"}"#);
+    assert!(!sse.is_http() && !sse.is_stdio() && !sse.is_runnable());
+
+    // An http declaration without a URL is not connectable.
+    let no_url = case(r#"{"type":"http"}"#);
+    assert!(!no_url.is_http() && !no_url.is_runnable());
+}
+
+#[test]
+fn load_for_dir_keeps_http_servers_and_drops_sse() {
+    let _guard = crate::storage::lock_test_env();
+    let previous_home = std::env::var_os("JCODE_HOME");
+    let home = tempfile::tempdir().expect("home tempdir");
+    let project = tempfile::tempdir().expect("project tempdir");
+    crate::env::set_var("JCODE_HOME", home.path());
+    std::fs::write(
+        project.path().join(".mcp.json"),
+        r#"{"mcpServers":{
+            "remote-http":{"type":"http","url":"https://example.test/mcp","headers":{"Authorization":"Bearer t"}},
+            "legacy-sse":{"type":"sse","url":"https://example.test/sse"},
+            "local-stdio":{"command":"some-bin"}
+        }}"#,
+    )
+    .expect("write project MCP config");
+
+    let result = std::panic::catch_unwind(|| {
+        let config = McpConfig::load_for_dir(Some(project.path()));
+        assert!(
+            config.servers.contains_key("remote-http"),
+            "http servers must survive load now that the transport is supported"
+        );
+        assert!(config.servers.contains_key("local-stdio"));
+        assert!(
+            !config.servers.contains_key("legacy-sse"),
+            "the legacy SSE transport stays filtered out"
+        );
+    });
+
+    if let Some(previous_home) = previous_home {
+        crate::env::set_var("JCODE_HOME", previous_home);
+    } else {
+        crate::env::remove_var("JCODE_HOME");
+    }
+    result.expect("http retention assertions");
 }
 
 #[test]

@@ -219,6 +219,10 @@ struct McpToolInput {
     args: Option<Vec<String>>,
     #[serde(default)]
     env: Option<HashMap<String, String>>,
+    #[serde(default)]
+    url: Option<String>,
+    #[serde(default)]
+    headers: Option<HashMap<String, String>>,
 }
 
 pub struct McpManagementTool {
@@ -266,7 +270,7 @@ impl Tool for McpManagementTool {
                 },
                 "command": {
                     "type": "string",
-                    "description": "Server command."
+                    "description": "Server command (stdio servers)."
                 },
                 "args": {
                     "type": "array",
@@ -277,6 +281,15 @@ impl Tool for McpManagementTool {
                     "type": "object",
                     "additionalProperties": {"type": "string"},
                     "description": "Server env."
+                },
+                "url": {
+                    "type": "string",
+                    "description": "Endpoint URL (streamable HTTP servers)."
+                },
+                "headers": {
+                    "type": "object",
+                    "additionalProperties": {"type": "string"},
+                    "description": "Extra HTTP request headers, e.g. Authorization."
                 }
             },
             "required": ["action"]
@@ -421,10 +434,11 @@ impl McpManagementTool {
             .server
             .ok_or_else(|| anyhow::anyhow!("'server' is required for connect action"))?;
 
-        // With an explicit command this is an ad-hoc connect. Without one, fall
-        // back to the configured server of that name, which also lets disabled
-        // configured servers be connected on demand, session-scoped, without
-        // rewriting config (issue #436).
+        // With an explicit command or URL this is an ad-hoc connect (stdio or
+        // streamable HTTP). Without either, fall back to the configured server
+        // of that name, which also lets disabled configured servers be
+        // connected on demand, session-scoped, without rewriting config
+        // (issue #436).
         let config = if let Some(command) = params.command {
             McpServerConfig {
                 command,
@@ -437,13 +451,25 @@ impl McpManagementTool {
                 enabled: None,
                 disabled: None,
             }
+        } else if let Some(url) = params.url {
+            McpServerConfig {
+                command: String::new(),
+                args: Vec::new(),
+                env: HashMap::new(),
+                shared: true,
+                transport: Some("http".to_string()),
+                url: Some(url),
+                headers: params.headers.unwrap_or_default(),
+                enabled: None,
+                disabled: None,
+            }
         } else {
             let manager = self.manager.read().await;
             let configured = manager.config().servers.get(&server_name).cloned();
             drop(manager);
             configured.ok_or_else(|| {
                 anyhow::anyhow!(
-                    "'command' is required for connect action ('{}' is not in the MCP config)",
+                    "'command' (stdio) or 'url' (HTTP) is required for connect action ('{}' is not in the MCP config)",
                     server_name
                 )
             })?
@@ -824,6 +850,89 @@ mod tests {
         let result = tool.execute(input, ctx).await;
         assert!(result.is_err());
         assert!(result.unwrap_err().to_string().contains("command"));
+    }
+
+    /// Ad-hoc HTTP connect: a `url` (no `command`) must take the streamable
+    /// HTTP path. The fake server answers initialize/tools-list with minimal
+    /// JSON-RPC bodies over HTTP.
+    #[tokio::test]
+    async fn test_connect_adhoc_http_server_by_url() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
+        let url = format!("http://{}/mcp", listener.local_addr().expect("addr"));
+        let server = tokio::spawn(async move {
+            loop {
+                let Ok((mut stream, _)) = listener.accept().await else {
+                    return;
+                };
+                tokio::spawn(async move {
+                    let mut buf = vec![0u8; 65536];
+                    loop {
+                        let Ok(n) = stream.read(&mut buf).await else {
+                            return;
+                        };
+                        if n == 0 {
+                            return;
+                        }
+                        let request = String::from_utf8_lossy(&buf[..n]).to_string();
+                        let id: u64 = request
+                            .rfind("\"id\":")
+                            .map(|pos| {
+                                request[pos + 5..]
+                                    .chars()
+                                    .take_while(char::is_ascii_digit)
+                                    .collect::<String>()
+                                    .parse()
+                                    .unwrap_or(0)
+                            })
+                            .unwrap_or(0);
+                        let body = if request.contains("\"initialize\"") {
+                            format!(
+                                r#"{{"jsonrpc":"2.0","id":{id},"result":{{"protocolVersion":"2025-03-26","capabilities":{{"tools":{{}}}},"serverInfo":{{"name":"adhoc-http","version":"0"}}}}}}"#
+                            )
+                        } else if request.contains("\"tools/list\"") {
+                            format!(
+                                r#"{{"jsonrpc":"2.0","id":{id},"result":{{"tools":[{{"name":"ping","description":"Ping","inputSchema":{{"type":"object"}}}}]}}}}"#
+                            )
+                        } else {
+                            String::new()
+                        };
+                        let response = if body.is_empty() {
+                            "HTTP/1.1 202 Accepted\r\ncontent-length: 0\r\n\r\n".to_string()
+                        } else {
+                            format!(
+                                "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\n\r\n{}",
+                                body.len(),
+                                body
+                            )
+                        };
+                        if stream.write_all(response.as_bytes()).await.is_err() {
+                            return;
+                        }
+                    }
+                });
+            }
+        });
+
+        let tool = create_test_tool();
+        let ctx = create_test_context();
+        let input = json!({"action": "connect", "server": "adhoc-http", "url": url});
+
+        let result = tool.execute(input, ctx).await.expect("connect must run");
+        server.abort();
+        assert!(
+            result.output.contains("Connected to MCP server 'adhoc-http'"),
+            "ad-hoc url connect must succeed: {}",
+            result.output
+        );
+        assert!(
+            result.output.contains("ping"),
+            "tools from the http server must be listed: {}",
+            result.output
+        );
     }
 
     #[tokio::test]

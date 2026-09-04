@@ -1,5 +1,10 @@
 //! MCP Client - handles communication with a single MCP server
+//!
+//! Supports two transports: stdio (a spawned child process speaking JSON-RPC
+//! over stdin/stdout) and streamable HTTP (JSON-RPC over HTTP POST, see
+//! `super::http`). The transport is chosen from the server's config.
 
+use super::http::HttpTransport;
 use super::protocol::*;
 use anyhow::{Context, Result};
 use serde_json::Value;
@@ -11,15 +16,34 @@ use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::process::{Child, Command};
 use tokio::sync::{Mutex, mpsc, oneshot};
 
+const REQUEST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// Protocol revision requested over stdio (the original transport).
+const STDIO_PROTOCOL_VERSION: &str = "2024-11-05";
+/// Protocol revision that introduced streamable HTTP.
+const HTTP_PROTOCOL_VERSION: &str = "2025-03-26";
+
+/// Transport-specific half of a connection.
+#[derive(Clone)]
+enum HandleTransport {
+    Stdio(StdioHandle),
+    Http(Arc<HttpTransport>),
+}
+
+#[derive(Clone)]
+struct StdioHandle {
+    request_id: Arc<AtomicU64>,
+    pending: Arc<Mutex<HashMap<u64, oneshot::Sender<JsonRpcResponse>>>>,
+    writer_tx: mpsc::Sender<String>,
+}
+
 /// Shared communication handle for an MCP server.
 /// Multiple sessions can hold clones of this and send concurrent requests.
 /// Request/response correlation by ID ensures no interference.
 #[derive(Clone)]
 pub struct McpHandle {
     pub(crate) name: String,
-    request_id: Arc<AtomicU64>,
-    pending: Arc<Mutex<HashMap<u64, oneshot::Sender<JsonRpcResponse>>>>,
-    writer_tx: mpsc::Sender<String>,
+    transport: HandleTransport,
     server_info: Arc<std::sync::RwLock<Option<ServerInfo>>>,
     capabilities: Arc<std::sync::RwLock<ServerCapabilities>>,
     tools: Arc<std::sync::RwLock<Vec<McpToolDef>>>,
@@ -28,31 +52,57 @@ pub struct McpHandle {
 impl McpHandle {
     /// Send a request and wait for response
     pub async fn request(&self, method: &str, params: Option<Value>) -> Result<JsonRpcResponse> {
-        let id = self.request_id.fetch_add(1, Ordering::SeqCst);
-        let request = JsonRpcRequest::new(id, method, params);
+        let response = match &self.transport {
+            HandleTransport::Stdio(stdio) => {
+                let id = stdio.request_id.fetch_add(1, Ordering::SeqCst);
+                let request = JsonRpcRequest::new(id, method, params);
 
-        let (tx, rx) = oneshot::channel();
-        {
-            let mut pending = self.pending.lock().await;
-            pending.insert(id, tx);
-        }
+                let (tx, rx) = oneshot::channel();
+                {
+                    let mut pending = stdio.pending.lock().await;
+                    pending.insert(id, tx);
+                }
 
-        let msg = serde_json::to_string(&request)? + "\n";
-        self.writer_tx
-            .send(msg)
+                let msg = serde_json::to_string(&request)? + "\n";
+                stdio
+                    .writer_tx
+                    .send(msg)
+                    .await
+                    .context("Failed to send request")?;
+
+                tokio::time::timeout(REQUEST_TIMEOUT, rx)
+                    .await
+                    .context("Request timeout")?
+                    .context("Channel closed")?
+            }
+            HandleTransport::Http(http) => tokio::time::timeout(
+                REQUEST_TIMEOUT,
+                http.request(method, params),
+            )
             .await
-            .context("Failed to send request")?;
-
-        let response = tokio::time::timeout(std::time::Duration::from_secs(30), rx)
-            .await
-            .context("Request timeout")?
-            .context("Channel closed")?;
+            .context("Request timeout")??,
+        };
 
         if let Some(err) = &response.error {
             anyhow::bail!("MCP error {}: {}", err.code, err.message);
         }
 
         Ok(response)
+    }
+
+    /// Send a notification (no response expected)
+    async fn notify(&self, method: &str, params: Option<Value>) -> Result<()> {
+        match &self.transport {
+            HandleTransport::Stdio(stdio) => {
+                let notif = JsonRpcNotification::new(method, params);
+                let msg = serde_json::to_string(&notif)? + "\n";
+                stdio.writer_tx.send(msg).await?;
+            }
+            HandleTransport::Http(http) => {
+                http.notify(method, params).await?;
+            }
+        }
+        Ok(())
     }
 
     /// Call a tool
@@ -114,12 +164,14 @@ impl McpHandle {
     }
 }
 
-/// MCP Client - owns the child process and provides shared handles.
-/// Only one McpClient exists per MCP server process, but many McpHandle
-/// clones can be distributed to different sessions.
+/// MCP Client - owns the connection (child process for stdio, HTTP session
+/// for streamable HTTP) and provides shared handles. Only one McpClient
+/// exists per MCP server, but many McpHandle clones can be distributed to
+/// different sessions.
 pub struct McpClient {
     handle: McpHandle,
-    child: Child,
+    /// Child process for stdio servers. `None` for HTTP servers.
+    child: Option<Child>,
 }
 
 impl McpClient {
@@ -130,13 +182,18 @@ impl McpClient {
 
     /// Connect to an MCP server, optionally running it in `working_dir`.
     ///
-    /// The working directory is only applied when it exists; otherwise the
-    /// subprocess falls back to inheriting the current process cwd (issue #557).
+    /// HTTP servers connect over the network and ignore `working_dir`. For
+    /// stdio servers the working directory is only applied when it exists;
+    /// otherwise the subprocess falls back to inheriting the current process
+    /// cwd (issue #557).
     pub async fn connect_in_dir(
         name: String,
         config: &McpServerConfig,
         working_dir: Option<&std::path::Path>,
     ) -> Result<Self> {
+        if config.is_http() {
+            return Self::connect_http(name, config).await;
+        }
         let working_dir = working_dir.filter(|dir| dir.is_dir());
         crate::logging::info(&format!(
             "MCP: Connecting to '{}' ({} {:?}) cwd={:?}",
@@ -250,23 +307,62 @@ impl McpClient {
 
         let handle = McpHandle {
             name: name.clone(),
-            request_id: Arc::new(AtomicU64::new(1)),
-            pending,
-            writer_tx,
+            transport: HandleTransport::Stdio(StdioHandle {
+                request_id: Arc::new(AtomicU64::new(1)),
+                pending,
+                writer_tx,
+            }),
             server_info: Arc::new(std::sync::RwLock::new(None)),
             capabilities: Arc::new(std::sync::RwLock::new(ServerCapabilities::default())),
             tools: Arc::new(std::sync::RwLock::new(Vec::new())),
         };
 
-        let mut client = Self { handle, child };
+        let mut client = Self {
+            handle,
+            child: Some(child),
+        };
+        client.finish_connect(&name).await?;
+        Ok(client)
+    }
 
-        client
-            .initialize()
+    /// Connect to a streamable HTTP MCP server (issue: HTTP/SSE entries used
+    /// to be recognized but skipped).
+    pub(crate) async fn connect_http(name: String, config: &McpServerConfig) -> Result<Self> {
+        let url = config
+            .url
+            .as_deref()
+            .map(str::trim)
+            .filter(|url| !url.is_empty())
+            .with_context(|| format!("MCP HTTP server '{}' has no 'url' configured", name))?
+            .to_string();
+
+        crate::logging::info(&format!("MCP: Connecting to '{}' over HTTP ({})", name, url));
+
+        let transport = HttpTransport::new(name.clone(), url, config.headers.clone())?;
+        let handle = McpHandle {
+            name: name.clone(),
+            transport: HandleTransport::Http(Arc::new(transport)),
+            server_info: Arc::new(std::sync::RwLock::new(None)),
+            capabilities: Arc::new(std::sync::RwLock::new(ServerCapabilities::default())),
+            tools: Arc::new(std::sync::RwLock::new(Vec::new())),
+        };
+
+        let mut client = Self {
+            handle,
+            child: None,
+        };
+        client.finish_connect(&name).await?;
+        Ok(client)
+    }
+
+    /// Shared tail of both connect paths: initialize handshake + first
+    /// tools/list.
+    async fn finish_connect(&mut self, name: &str) -> Result<()> {
+        self.initialize()
             .await
             .with_context(|| format!("MCP server '{}' failed to initialize", name))?;
 
-        client
-            .handle
+        self.handle
             .refresh_tools()
             .await
             .with_context(|| format!("MCP server '{}' failed to list tools", name))?;
@@ -274,10 +370,9 @@ impl McpClient {
         crate::logging::info(&format!(
             "MCP: Connected to '{}' with {} tools",
             name,
-            client.handle.tools().len()
+            self.handle.tools().len()
         ));
-
-        Ok(client)
+        Ok(())
     }
 
     /// Get a shareable handle to this client
@@ -287,8 +382,12 @@ impl McpClient {
 
     /// Initialize the MCP connection
     async fn initialize(&mut self) -> Result<()> {
+        let requested_version = match &self.handle.transport {
+            HandleTransport::Stdio(_) => STDIO_PROTOCOL_VERSION,
+            HandleTransport::Http(_) => HTTP_PROTOCOL_VERSION,
+        };
         let params = InitializeParams {
-            protocol_version: "2024-11-05".to_string(),
+            protocol_version: requested_version.to_string(),
             capabilities: ClientCapabilities::default(),
             client_info: ClientInfo {
                 name: "jcode".to_string(),
@@ -303,6 +402,11 @@ impl McpClient {
 
         if let Some(result) = response.result {
             let init_result: InitializeResult = serde_json::from_value(result)?;
+            // Streamable HTTP echoes the negotiated version on every
+            // subsequent request via the MCP-Protocol-Version header.
+            if let HandleTransport::Http(http) = &self.handle.transport {
+                http.set_protocol_version(&init_result.protocol_version);
+            }
             *self
                 .handle
                 .server_info
@@ -316,33 +420,41 @@ impl McpClient {
         }
 
         // Send initialized notification
-        let notif = JsonRpcNotification::new("notifications/initialized", None);
-        let msg = serde_json::to_string(&notif)? + "\n";
-        self.handle.writer_tx.send(msg).await?;
+        self.handle
+            .notify("notifications/initialized", None)
+            .await?;
 
         Ok(())
     }
 
-    /// Check if server is still running
+    /// Check if server is still running. HTTP servers have no local process;
+    /// they count as running until a request fails.
     pub fn is_running(&mut self) -> bool {
-        match self.child.try_wait() {
-            Ok(None) => true,
-            Ok(Some(_)) => false,
-            Err(_) => false,
+        match &mut self.child {
+            Some(child) => matches!(child.try_wait(), Ok(None)),
+            None => true,
         }
     }
 
     /// Shutdown the server
     pub async fn shutdown(&mut self) {
-        let _ = self
-            .handle
-            .writer_tx
-            .send("{\"jsonrpc\":\"2.0\",\"method\":\"shutdown\"}\n".to_string())
-            .await;
+        match &self.handle.transport {
+            HandleTransport::Stdio(stdio) => {
+                let _ = stdio
+                    .writer_tx
+                    .send("{\"jsonrpc\":\"2.0\",\"method\":\"shutdown\"}\n".to_string())
+                    .await;
 
-        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
 
-        let _ = self.child.kill().await;
+                if let Some(child) = &mut self.child {
+                    let _ = child.kill().await;
+                }
+            }
+            HandleTransport::Http(http) => {
+                http.close().await;
+            }
+        }
     }
 
     // === Legacy compatibility methods that delegate to handle ===
@@ -398,7 +510,9 @@ fn mcp_child_env(
 
 impl Drop for McpClient {
     fn drop(&mut self) {
-        let _ = self.child.start_kill();
+        if let Some(child) = &mut self.child {
+            let _ = child.start_kill();
+        }
     }
 }
 

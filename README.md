@@ -561,7 +561,7 @@ That imported file is then jcode-owned; later Codex changes are not synced
 automatically. Imported environment values are copied too and may contain
 secrets.
 
-Both the canonical `mcpServers` key and jcode's historical `servers` key are accepted. jcode currently supports stdio (command-based) servers only; HTTP/SSE entries (`"type": "http"`/`"sse"`) are recognized and skipped with a log line.
+Both the canonical `mcpServers` key and jcode's historical `servers` key are accepted. jcode supports stdio (command-based) servers and streamable HTTP servers (`"type": "http"` with a `"url"`, plus optional `"headers"` for authentication). The legacy two-endpoint SSE transport (`"type": "sse"`) is recognized and skipped with a log line.
 
 Example MCP config:
 
@@ -573,6 +573,11 @@ Example MCP config:
       "args": ["--root", "/workspace"],
       "env": {},
       "shared": true
+    },
+    "remote-api": {
+      "type": "http",
+      "url": "https://example.com/mcp",
+      "headers": { "Authorization": "Bearer ${MY_TOKEN}" }
     }
   }
 }
